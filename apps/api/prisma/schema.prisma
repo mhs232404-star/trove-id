@@ -1,0 +1,64 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id         String     @id @default(cuid())
+  telegramId String     @unique
+  name       String?
+  createdAt  DateTime   @default(now())
+  businesses Business[]
+
+  @@map("users")
+}
+
+model Business {
+  id             String    @id @default(cuid())
+  userId         String
+  gbpLocationId  String    @unique
+  gbpAccountId   String
+  name           String
+  accessToken    String
+  refreshToken   String
+  tokenExpiresAt DateTime
+  isActive       Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  user           User      @relation(fields: [userId], references: [id])
+  reviews        Review[]
+
+  @@map("businesses")
+}
+
+model Review {
+  id           String       @id @default(cuid())
+  businessId   String
+  gbpReviewId  String       @unique
+  reviewerName String
+  rating       Int
+  comment      String?
+  sentiment    String?
+  status       String       @default("NEW")
+  publishedAt  DateTime
+  createdAt    DateTime     @default(now())
+  business     Business     @relation(fields: [businessId], references: [id])
+  reply        ReviewReply?
+
+  @@map("reviews")
+}
+
+model ReviewReply {
+  id        String    @id @default(cuid())
+  reviewId  String    @unique
+  body      String
+  source    String
+  postedAt  DateTime?
+  createdAt DateTime  @default(now())
+  review    Review    @relation(fields: [reviewId], references: [id])
+
+  @@map("review_replies")
+} 
