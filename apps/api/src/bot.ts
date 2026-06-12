@@ -3,13 +3,18 @@ import { generateReply, generateReplyNoComment } from './gemini-service.js'
 import { createRequire } from 'module'
 import { PrismaClient } from '@prisma/client'
 import { getAuthUrl } from './google.js'
+import { Pool } from 'pg'
+import { PrismaPg } from '@prisma/adapter-pg'
 
 const require = createRequire(import.meta.url)
 const dotenv = require('dotenv')
 dotenv.config()
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN!)
-const prisma = new PrismaClient({ log: ['error'] })
+const connectionString = process.env.DATABASE_URL!
+const pool = new Pool({ connectionString })
+const adapter = new PrismaPg(pool)
+const prisma = new PrismaClient({ adapter, log: ['error'] })
 
 // ==========================================
 // 1. COMMAND DASAR
