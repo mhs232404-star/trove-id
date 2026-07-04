@@ -6,28 +6,27 @@ const prisma = new PrismaClient()
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  'http://localhost:3000/api/auth/callback/google'
+  'https://gray-maker-smelting.ngrok-free.dev/api/auth/callback/google'
 )
 
-/**
- * Langkah 1: Menarik data Akun dan Lokasi Asli dari Google
- */
 export async function simpanBisnisKeDatabase(telegramId: string) {
-  oauth2Client.setCredentials({
-    refresh_token: process.env.GOOGLE_REFRESH_TOKEN
-  })
-
   try {
     const user = await prisma.user.findUnique({
-      where: { telegramId }
+      where: { telegramId },
+      include: { googleAccounts: true }
     })
 
-    if (!user) {
-      console.log("❌ User belum terdaftar di database.")
+    const googleAccount = user?.googleAccounts?.[0]
+
+    if (!user || !googleAccount) {
       return null
     }
 
-    // 1. Mengambil Daftar Akun Google Business (Account ID)
+    oauth2Client.setCredentials({
+      access_token: googleAccount.accessToken,
+      refresh_token: googleAccount.refreshToken
+    })
+
     const accountRes = await oauth2Client.request({
       url: 'https://mybusinessaccountmanagement.googleapis.com/v1/accounts',
       method: 'GET'
@@ -35,15 +34,12 @@ export async function simpanBisnisKeDatabase(telegramId: string) {
     
     const accounts = (accountRes.data as any).accounts
     if (!accounts || accounts.length === 0) {
-      console.log("❌ Tidak ada akun bisnis yang terhubung dengan email ini.")
       return null
     }
     
-    // Kita ambil akun pertama
     const accountName = accounts[0].name 
     const accountId = accountName.split('/')[1]
 
-    // 2. Mengambil Daftar Lokasi Bisnis (Location ID)
     const locationRes = await oauth2Client.request({
       url: `https://mybusinessbusinessinformation.googleapis.com/v1/${accountName}/locations?readMask=name,title`,
       method: 'GET'
@@ -51,68 +47,51 @@ export async function simpanBisnisKeDatabase(telegramId: string) {
 
     const locations = (locationRes.data as any).locations
     if (!locations || locations.length === 0) {
-      console.log("❌ Tidak ada lokasi bisnis (toko) yang ditemukan di akun ini.")
       return null
     }
 
-    // Kita ambil lokasi pertama
     const locationName = locations[0].name 
     const locationId = locationName.split('/')[3]
     const namaBisnisAsli = locations[0].title
 
-    // 3. Simpan ke Database
-    const tokenResponse = await oauth2Client.getAccessToken()
-    
     const bisnis = await prisma.business.upsert({
       where: { gbpLocationId: locationId },
-      update: {
-        accessToken: tokenResponse.token || "",
-        refreshToken: process.env.GOOGLE_REFRESH_TOKEN || "",
-        tokenExpiresAt: new Date(Date.now() + 3600 * 1000),
-      },
+      update: {},
       create: {
         userId: user.id,
+        googleAccountId: googleAccount.id,
         gbpLocationId: locationId,
         gbpAccountId: accountId,
         name: namaBisnisAsli,
-        accessToken: tokenResponse.token || "",
-        refreshToken: process.env.GOOGLE_REFRESH_TOKEN || "",
-        tokenExpiresAt: new Date(Date.now() + 3600 * 1000),
         isActive: true
       }
     })
 
-    console.log(`✅ Bisnis Asli "${bisnis.name}" berhasil ditarik dan disimpan!`)
     return bisnis
-
   } catch (error: any) {
-    console.error("❌ Gagal menarik data bisnis asli:", error.response?.data || error.message)
     return null
   }
 }
 
-/**
- * Langkah 2: Menarik ulasan pelanggan yang sesungguhnya dari Google Maps
- */
 export async function tarikDanSimpanUlasan(businessId: string) {
   try {
-    console.log("⏳ Menarik ulasan pelanggan asli dari Google Maps...")
-    
     const bisnis = await prisma.business.findUnique({
-      where: { id: businessId }
+      where: { id: businessId },
+      include: { googleAccount: true }
     })
 
-    if (!bisnis) return
+    const akunGoogle = bisnis?.googleAccount
+
+    if (!bisnis || !akunGoogle) return 0
 
     oauth2Client.setCredentials({
-      access_token: bisnis.accessToken,
-      refresh_token: bisnis.refreshToken
+      access_token: akunGoogle.accessToken,
+      refresh_token: akunGoogle.refreshToken
     })
 
     const accountName = `accounts/${bisnis.gbpAccountId}`
     const locationName = `locations/${bisnis.gbpLocationId}`
 
-    // 4. Mengambil Ulasan (Reviews) Menggunakan Google My Business API v4
     const reviewsRes = await oauth2Client.request({
       url: `https://mybusiness.googleapis.com/v4/${accountName}/${locationName}/reviews`,
       method: 'GET'
@@ -121,15 +100,12 @@ export async function tarikDanSimpanUlasan(businessId: string) {
     const reviews = (reviewsRes.data as any).reviews
     
     if (!reviews || reviews.length === 0) {
-      console.log("📊 Tidak ada ulasan pelanggan yang ditemukan di toko ini.")
       return 0
     }
 
     let ulasanBaruCount = 0
 
-    // Loop data ulasan asli dan simpan ke database
     for (const rev of reviews) {
-      
       const ratingMapping: { [key: string]: number } = {
         'ONE': 1, 'TWO': 2, 'THREE': 3, 'FOUR': 4, 'FIVE': 5
       }
@@ -153,10 +129,8 @@ export async function tarikDanSimpanUlasan(businessId: string) {
       }
     }
 
-    console.log(`📊 Sinkronisasi selesai. Berhasil menarik ${ulasanBaruCount} ulasan pelanggan asli.`)
     return ulasanBaruCount
-
   } catch (error: any) {
-    console.error("❌ Gagal menarik ulasan pelanggan:", error.response?.data || error.message)
+    return 0
   }
 }

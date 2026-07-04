@@ -2,7 +2,11 @@
   "extends": "../../packages/typescript-config/base.json",
   "compilerOptions": {
     "outDir": "./dist",
-    "rootDir": "./src"
+    "types": ["node"],
+    "rootDir": "."
   },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "prisma/**/*.ts"
+  ]
 }

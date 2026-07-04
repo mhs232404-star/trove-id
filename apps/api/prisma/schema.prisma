@@ -1,5 +1,5 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
   previewFeatures = ["driverAdapters"]
 }
 
@@ -9,28 +9,44 @@ datasource db {
 }
 
 model User {
-  id         String     @id @default(cuid())
-  telegramId String     @unique
-  name       String?
-  createdAt  DateTime   @default(now())
-  businesses Business[]
+  id             String          @id @default(cuid())
+  telegramId     String          @unique
+  name           String?
+  createdAt      DateTime        @default(now())
+  businesses     Business[]
+  googleAccounts GoogleAccount[]
 
   @@map("users")
 }
 
-model Business {
-  id             String    @id @default(cuid())
+model GoogleAccount {
+  id             String     @id @default(cuid())
   userId         String
-  gbpLocationId  String    @unique
-  gbpAccountId   String
-  name           String
+  email          String
   accessToken    String
   refreshToken   String
   tokenExpiresAt DateTime
-  isActive       Boolean   @default(true)
-  createdAt      DateTime  @default(now())
-  user           User      @relation(fields: [userId], references: [id])
-  reviews        Review[]
+  createdAt      DateTime   @default(now())
+  user           User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businesses     Business[]
+
+  @@unique([userId, email])
+  @@map("google_accounts")
+}
+
+model Business {
+  id              String        @id @default(cuid())
+  userId          String
+  googleAccountId String
+  gbpLocationId   String?       @unique
+  gbpAccountId    String?
+  name            String
+  isActive        Boolean       @default(true)
+  createdAt       DateTime      @default(now())
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  googleAccount   GoogleAccount @relation(fields: [googleAccountId], references: [id], onDelete: Cascade)
+  reviews         Review[]
+  notifications   Notification[]
 
   @@map("businesses")
 }
@@ -62,4 +78,21 @@ model ReviewReply {
   review    Review    @relation(fields: [reviewId], references: [id])
 
   @@map("review_replies")
-} 
+}
+
+model Notification {
+  id                String   @id @default(cuid())
+  businessId        String
+  notificationType  String
+  message           String
+  status            String   @default("SENT")
+  telegramMessageId String?
+  metadata          Json?
+  createdAt         DateTime @default(now())
+  business          Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@map("notifications")
+  @@index([businessId])
+  @@index([notificationType])
+  @@index([createdAt])
+}

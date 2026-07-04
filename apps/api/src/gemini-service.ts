@@ -1,12 +1,8 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenerativeAI } from '@google/generative-ai'
 
-// Inisialisasi Gemini menggunakan API Key dari .env
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!)
+const model = genAI.getGenerativeModel({ model: 'gemini-flash-lite-latest' })
 
-/**
- * Fungsi 1: Untuk pelanggan yang memberikan Rating DAN Komentar
- */
 export async function generateReply(
   reviewerName: string,
   rating: number,
@@ -29,19 +25,15 @@ export async function generateReply(
       3. Balasan harus singkat, tidak lebih dari 3 kalimat.
       4. Jangan gunakan bahasa robot. Gunakan gaya bahasa ramah dan sopan (misal: menggunakan kata "Kak", dsb).
       5. Langsung berikan teks balasannya saja, tanpa basa-basi pengantar.
-    `;
+    `
 
-    const result = await model.generateContent(prompt);
-    return result.response.text().trim();
+    const result = await model.generateContent(prompt)
+    return result.response.text().trim()
   } catch (error: any) {
-    console.error("❌ Gagal meracik balasan AI (Dengan Komentar):", error.message);
-    return "Maaf, AI sedang mengalami gangguan saat meracik balasan. Silakan balas manual.";
+    return "Maaf, AI sedang mengalami gangguan saat meracik balasan. Silakan balas manual."
   }
 }
 
-/**
- * Fungsi 2: Untuk pelanggan yang HANYA memberikan Bintang (Tanpa Komentar)
- */
 export async function generateReplyNoComment(
   reviewerName: string,
   rating: number,
@@ -63,12 +55,11 @@ export async function generateReplyNoComment(
       3. Balasan harus singkat, maksimal 2 kalimat saja.
       4. Gaya bahasa ramah dan sopan.
       5. Langsung berikan teks balasannya saja, tanpa basa-basi pengantar.
-    `;
+    `
 
-    const result = await model.generateContent(prompt);
-    return result.response.text().trim();
+    const result = await model.generateContent(prompt)
+    return result.response.text().trim()
   } catch (error: any) {
-    console.error("❌ Gagal meracik balasan AI (Tanpa Komentar):", error.message);
-    return "Maaf, AI sedang mengalami gangguan saat meracik balasan. Silakan balas manual.";
+    return "Maaf, AI sedang mengalami gangguan saat meracik balasan. Silakan balas manual."
   }
 }

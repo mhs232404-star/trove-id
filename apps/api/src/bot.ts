@@ -1,250 +1,468 @@
-import { Bot, InlineKeyboard } from 'grammy'
-import { generateReply, generateReplyNoComment } from './gemini-service.js'
-import { createRequire } from 'module'
+import 'dotenv/config'
+import { Bot, InlineKeyboard, GrammyError, HttpError } from 'grammy'
 import { PrismaClient } from '@prisma/client'
+import { createAlertService } from './services/telegram-alert.service.js'
+import { startAllSchedulers } from './schedulers.js'
 import { getAuthUrl } from './google.js'
-import { Pool } from 'pg'
-import { PrismaPg } from '@prisma/adapter-pg'
+import { startServer } from './server.js'
+import { generateReply, generateReplyNoComment } from './gemini-service.js'
+import { businessTemplates } from './templates.js'
 
-const require = createRequire(import.meta.url)
-const dotenv = require('dotenv')
-dotenv.config()
-
+const prisma = new PrismaClient({ log: ['error'] })
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN!)
-const connectionString = process.env.DATABASE_URL!
-const pool = new Pool({ connectionString })
-const adapter = new PrismaPg(pool)
-const prisma = new PrismaClient({ adapter, log: ['error'] })
+const alertService = createAlertService(bot)
 
-// ==========================================
-// 1. COMMAND DASAR
-// ==========================================
+const renderMenu = async (telegramId: string) => {
+  const user = await prisma.user.findUnique({ where: { telegramId }, include: { googleAccounts: true } })
+  const isConnected = user && user.googleAccounts && user.googleAccounts.length > 0
+  let text = `🧭 <b>PUSAT KENDALI TROVE</b>\n━━━━━━━━━━━━━━━━━━\n\n`
+  if (!isConnected) {
+    text += `🔗 /login - Otorisasi Akun Google\n📥 /antrean - Pusat Balas Ulasan`
+  } else {
+    text += `🏢 /cabang - Kelola Lokasi Bisnis\n📥 /antrean - Pusat Balas Ulasan`
+  }
+  return text
+}
+
+const renderCabang = async (telegramId: string) => {
+  const user = await prisma.user.findUnique({ where: { telegramId }, include: { businesses: true, googleAccounts: true } })
+  if (!user) return null
+
+  let text = `🏢 <b>MANAJEMEN CABANG</b>\n━━━━━━━━━━━━━━━━━━\n`
+  const keyboard = new InlineKeyboard()
+
+  if (user.businesses.length === 0) {
+    text += `⚠️ <b>Belum Ada Cabang Terdaftar</b>\n\nAnda belum memiliki cabang bisnis yang terhubung ke sistem Trove. Silakan tambahkan lokasi bisnis Anda terlebih dahulu.`
+    keyboard.text('➕ Tambah Cabang', 'add_branch').row()
+  } else {
+    text += `Total Cabang Aktif: <b>${user.businesses.length}</b>\n\n`
+    user.businesses.forEach((b) => {
+      const acc = user.googleAccounts.find(g => g.id === b.googleAccountId)
+      const emailInfo = acc ? acc.email : 'Tidak diketahui'
+      text += `📍 <b>${b.name}</b>\n📧 <i>${emailInfo}</i>\n\n`
+    })
+    keyboard.text('➕ Tambah Cabang', 'add_branch').row()
+    keyboard.text('🗑️ Hapus Cabang', 'delete_branch').row()
+  }
+
+  keyboard.text('🔙 Menu Utama', 'back_to_menu')
+  return { text, keyboard }
+}
+
+const renderBranchList = async (telegramId: string, title: string, actionPrefix: string, icon: string) => {
+  const user = await prisma.user.findUnique({ where: { telegramId }, include: { businesses: true } })
+  if (!user || user.businesses.length === 0) return null
+  const keyboard = new InlineKeyboard()
+  user.businesses.forEach(b => keyboard.text(`${icon} ${b.name}`, `${actionPrefix}_${b.id}`).row())
+  keyboard.text('🔙 Menu Utama', 'back_to_menu')
+  return { text: title, keyboard }
+}
+
+async function processNextDraft(ctx: any, businessId: string) {
+  const review = await prisma.review.findFirst({
+    where: { businessId, status: { in: ['NEW', 'NOTIFIED'] } },
+    orderBy: { createdAt: 'asc' }
+  })
+
+  const business = await prisma.business.findUnique({ where: { id: businessId } })
+
+  if (!review) {
+    const keyboard = new InlineKeyboard().text('🔙 Menu Utama', `back_to_menu`)
+    const txt = `✨ <b>ANTREAN SELESAI</b> ✨\n━━━━━━━━━━━━━━━━━━\n\nSeluruh ulasan pelanggan untuk <b>${business?.name}</b> telah berhasil dibalas.`
+    if (ctx.callbackQuery) return ctx.editMessageText(txt, { parse_mode: 'HTML', reply_markup: keyboard })
+    return ctx.reply(txt, { parse_mode: 'HTML', reply_markup: keyboard })
+  }
+
+  let msg
+  if (ctx.callbackQuery) {
+    await ctx.editMessageText('⏳ <i>AI Kami sedang meracik balasan terbaik...</i>', { parse_mode: 'HTML' })
+  } else {
+    msg = await ctx.reply('⏳ <i>AI Kami sedang meracik balasan terbaik...</i>', { parse_mode: 'HTML' })
+  }
+
+  let aiResponse = ''
+  const safeComment = review.comment || ''
+  
+  if (safeComment.trim() !== '') {
+    aiResponse = await generateReply(review.reviewerName, review.rating, safeComment, business?.name || 'Bisnis')
+  } else {
+    aiResponse = await generateReplyNoComment(review.reviewerName, review.rating, business?.name || 'Bisnis')
+  }
+
+  await prisma.reviewReply.upsert({
+    where: { reviewId: review.id },
+    update: { body: aiResponse, source: 'AI_GEMINI', postedAt: new Date() },
+    create: { reviewId: review.id, body: aiResponse, source: 'AI_GEMINI', postedAt: new Date() }
+  })
+
+  await prisma.review.update({
+    where: { id: review.id },
+    data: { status: 'DRAFT' }
+  })
+
+  const stars = '⭐'.repeat(review.rating)
+  const textPreview = `📝 <b>DRAFT BALASAN AI</b>\n━━━━━━━━━━━━━━━━━━\n👤 <b>Pelanggan:</b> ${review.reviewerName}\n🌟 <b>Penilaian:</b> ${stars}\n💬 <i>"${review.comment || 'Tidak ada teks'}"</i>\n\n🤖 <b>Rancangan Balasan:</b>\n${aiResponse}\n━━━━━━━━━━━━━━━━━━\n❓ <i>Pilih tindakan untuk ulasan ini:</i>`
+
+  const keyboard = new InlineKeyboard()
+    .text('✅ Kirim Balasan', `send_draft_${review.id}`).row()
+    .text('✏️ Tulis Manual', `edit_draft_${review.id}`).row()
+    .text('❌ Hentikan Proses', `cancel_draft_${review.id}`)
+
+  if (ctx.callbackQuery) {
+    await ctx.editMessageText(textPreview, { parse_mode: 'HTML', reply_markup: keyboard })
+  } else {
+    await ctx.api.editMessageText(ctx.chat?.id!, msg.message_id, textPreview, { parse_mode: 'HTML', reply_markup: keyboard })
+  }
+}
 
 bot.command('start', async (ctx) => {
   const telegramId = ctx.from?.id.toString()
   const name = ctx.from?.first_name
-
   if (!telegramId) return
-
   const existingUser = await prisma.user.findUnique({ where: { telegramId } })
-
   if (existingUser) {
-    await ctx.reply(`Halo lagi, <b>${name}</b>! 👋\n\nKetik /menu untuk melihat kontrol dasbor.`, { parse_mode: 'HTML' })
-    return
+    return ctx.reply(`Selamat datang kembali, <b>${name}</b>! 👋\n\nKetik /menu untuk membuka Pusat Kendali.`, { parse_mode: 'HTML' })
   }
-
   await prisma.user.create({ data: { telegramId, name } })
-
-  await ctx.reply(
-    `Halo <b>${name}</b>! Selamat datang di Trove 👋\n\n` +
-    `Saya adalah asisten virtual yang akan membantu memantau dan membalas ulasan Google Maps bisnismu secara otomatis.\n\n` +
-    `Ketik /menu untuk memulai.`,
-    { parse_mode: 'HTML' }
-  )
+  await ctx.reply(`Halo <b>${name}</b>! Selamat datang di Trove 👋\n\nAsisten virtual cerdas untuk manajemen ulasan Google Maps bisnis Anda.\n\nKetik /menu untuk memulai konfigurasi.`, { parse_mode: 'HTML' })
 })
 
 bot.command('menu', async (ctx) => {
-  await ctx.reply(
-    `📋 <b>Menu Utama Trove</b>\n\n` +
-    `/login - 🔗 Hubungkan akun Google Bisnis\n` +
-    `/antrean - 📥 Cek ulasan yang belum dibalas\n` +
-    `/status - 📊 Cek performa profil bisnismu\n`,
-    { parse_mode: 'HTML' }
-  )
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+  const text = await renderMenu(telegramId)
+  await ctx.reply(text, { parse_mode: 'HTML' })
 })
 
 bot.command('login', async (ctx) => {
-  const url = getAuthUrl();
-  const keyboard = new InlineKeyboard().url("🔗 Otorisasi Akun Google", url);
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+  const user = await prisma.user.findUnique({ where: { telegramId }, include: { googleAccounts: true } })
+  if (user && user.googleAccounts && user.googleAccounts.length > 0) {
+    return ctx.reply('✅ Akun Google Anda telah terhubung secara aman.')
+  }
+  const url = getAuthUrl(telegramId)
+  const keyboard = new InlineKeyboard().url('🔗 Otorisasi via Web', url)
+  await ctx.reply('🔐 <b>OTORISASI GOOGLE</b>\n━━━━━━━━━━━━━━━━━━\nSistem memerlukan izin akses Google Business Profile untuk menyinkronkan data ulasan secara <b>real-time</b>.\n\nKlik tautan di bawah untuk menghubungkan akun:', { parse_mode: 'HTML', reply_markup: keyboard })
+})
 
-  await ctx.reply(
-    "🔒 <b>Koneksi Google Bisnis</b>\n\n" +
-    "Agar Trove bisa menarik ulasan asli dan mengirimkan balasan, sistem membutuhkan izin akses baca/tulis ke Google Business Profile kamu.\n\n" +
-    "Klik tombol di bawah untuk menghubungkan:",
-    { parse_mode: 'HTML', reply_markup: keyboard }
-  );
-});
-
-// ==========================================
-// 2. FITUR UTAMA: CEK ANTREAN ULASAN REAL
-// ==========================================
+bot.command('cabang', async (ctx) => {
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+  const data = await renderCabang(telegramId)
+  if (!data) return ctx.reply('❌ Anda belum memiliki bisnis aktif. Silahkan login terlebih dahulu')
+  await ctx.reply(data.text, { parse_mode: 'HTML', reply_markup: data.keyboard })
+})
 
 bot.command('antrean', async (ctx) => {
-  const telegramId = ctx.from?.id.toString();
-  if (!telegramId) return;
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+  const data = await renderBranchList(telegramId, '📥 <b>PUSAT BALAS ULASAN</b>\n━━━━━━━━━━━━━━━━━━\nSilakan pilih lokasi bisnis untuk memproses antrean:', 'antrean', '📍')
+  if (!data) return ctx.reply('❌ Anda belum memiliki bisnis aktif. Silahkan login terlebih dahulu')
+  await ctx.reply(data.text, { parse_mode: 'HTML', reply_markup: data.keyboard })
+})
 
-  const loadingMsg = await ctx.reply("⏳ <i>Mengecek database...</i>", { parse_mode: 'HTML' });
+bot.callbackQuery(/^antrean_(.+)$/, async (ctx) => {
+  const businessId = ctx.match[1] as string
+  const business = await prisma.business.findUnique({ where: { id: businessId } })
+  const reviews = await prisma.review.findMany({ 
+    where: { businessId, status: { in: ['NEW', 'NOTIFIED'] } },
+    orderBy: { createdAt: 'asc' }
+  })
 
-  try {
-    // Cari user dan bisnisnya
-    const user = await prisma.user.findUnique({
-      where: { telegramId },
-      include: { businesses: true }
-    });
+  const keyboard = new InlineKeyboard()
 
-    if (!user || user.businesses.length === 0) {
-      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, "❌ Kamu belum menghubungkan bisnis apa pun. Gunakan /login terlebih dahulu.");
+  if (reviews.length === 0) {
+    keyboard.text('🔙 Kembali', 'back_to_antrean')
+    return ctx.editMessageText(`✅ <b>TIDAK ADA ANTREAN</b>\n━━━━━━━━━━━━━━━━━━\n\nSemua ulasan untuk <b>${business?.name}</b> telah ditangani dengan baik.`, { parse_mode: 'HTML', reply_markup: keyboard })
+  }
+
+  let text = `📥 <b>ANTREAN AKTIF</b>\n🏢 <b>${business?.name}</b>\n━━━━━━━━━━━━━━━━━━\nTerdapat <b>${reviews.length}</b> ulasan menunggu respon:\n\n`
+  reviews.slice(0, 5).forEach((r, idx) => {
+    const stars = '⭐'.repeat(r.rating)
+    text += `${idx + 1}. <b>${r.reviewerName}</b> ${stars}\n`
+  })
+
+  if (reviews.length > 5) text += `\n<i>...dan ${reviews.length - 5} ulasan lainnya.</i>`
+  text += `\n\nKlik tombol di bawah untuk memulai proses kurasi balasan.`
+
+  keyboard.text('🤖 Mulai Sesi Balasan', `reply_ai_${businessId}`).row().text('🔙 Kembali', 'back_to_antrean')
+  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard })
+})
+
+bot.callbackQuery(/^reply_ai_(.+)$/, async (ctx) => {
+  const businessId = ctx.match[1] as string
+  await processNextDraft(ctx, businessId)
+})
+
+bot.callbackQuery(/^send_draft_(.+)$/, async (ctx) => {
+  const reviewId = ctx.match[1] as string
+  const review = await prisma.review.findUnique({ where: { id: reviewId } })
+  if (!review) return
+  await prisma.review.update({ where: { id: reviewId }, data: { status: 'REPLIED' } })
+  await processNextDraft(ctx, review.businessId)
+})
+
+bot.callbackQuery(/^edit_draft_(.+)$/, async (ctx) => {
+  const reviewId = ctx.match[1] as string
+  await ctx.deleteMessage()
+  await ctx.reply(`✏️ <b>MODE TULIS MANUAL</b>\n━━━━━━━━━━━━━━━━━━\nSilakan ketik langsung teks balasan Anda untuk ulasan ini.\n\n<tg-spoiler>(Ref ID: ${reviewId})</tg-spoiler>`, {
+    parse_mode: 'HTML',
+    reply_markup: { force_reply: true }
+  })
+})
+
+bot.callbackQuery(/^cancel_draft_(.+)$/, async (ctx) => {
+  const reviewId = ctx.match[1] as string
+  const review = await prisma.review.findUnique({ where: { id: reviewId } })
+  if (!review) return
+  await prisma.reviewReply.delete({ where: { reviewId } })
+  await prisma.review.update({ where: { id: reviewId }, data: { status: 'NEW' } })
+  
+  const business = await prisma.business.findUnique({ where: { id: review.businessId } })
+  const reviews = await prisma.review.findMany({ where: { businessId: review.businessId, status: { in: ['NEW', 'NOTIFIED'] } } })
+  const keyboard = new InlineKeyboard()
+  
+  if (reviews.length === 0) {
+    keyboard.text('🔙 Kembali', 'back_to_antrean')
+    return ctx.editMessageText(`✅ <b>TIDAK ADA ANTREAN</b>\n━━━━━━━━━━━━━━━━━━\n\nSemua ulasan untuk <b>${business?.name}</b> telah ditangani dengan baik.`, { parse_mode: 'HTML', reply_markup: keyboard })
+  }
+  
+  let text = `🛑 <b>PROSES DIHENTIKAN</b>\n🏢 <b>${business?.name}</b>\n━━━━━━━━━━━━━━━━━━\nSisa ulasan tertunda: <b>${reviews.length}</b>\n\n`
+  keyboard.text('▶️ Lanjutkan Sesi', `reply_ai_${review.businessId}`).row().text('🔙 Kembali ke Menu', 'back_to_antrean')
+  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard })
+})
+
+bot.callbackQuery('add_branch', async (ctx) => {
+  const text = `➕ <b>REGISTRASI CABANG BARU</b>\n━━━━━━━━━━━━━━━━━━\nTentukan metode sinkronisasi akun Google Business Profile:`
+  const keyboard = new InlineKeyboard().text('📧 Pakai Email Terdaftar', 'use_existing_email').row().text('🆕 Tautkan Akun Baru', 'add_new_email').row().text('❌ Batal', 'back_to_cabang')
+  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard })
+})
+
+bot.callbackQuery('use_existing_email', async (ctx) => {
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+
+  const user = await prisma.user.findUnique({
+    where: { telegramId },
+    include: { googleAccounts: true }
+  })
+
+  if (!user || user.googleAccounts.length === 0) {
+    return ctx.answerCallbackQuery({ 
+      text: 'Belum ada email yang terhubung. Silakan gunakan opsi Tambah Akun Baru.', 
+      show_alert: true 
+    })
+  }
+
+  const keyboard = new InlineKeyboard()
+  
+  user.googleAccounts.forEach(account => {
+    keyboard.text(`📧 ${account.email}`, `confirm_add_branch_${account.id}`).row()
+  })
+  
+  keyboard.text('🔙 Batal', 'back_to_cabang')
+
+  await ctx.editMessageText(
+    '📥 <b>Pilih Akun Email</b>\n━━━━━━━━━━━━━━━━━━\n\nSilakan pilih email terdaftar mana yang ingin Anda gunakan untuk membuat cabang baru:',
+    { parse_mode: 'HTML', reply_markup: keyboard }
+  )
+})
+
+bot.callbackQuery('add_new_email', async (ctx) => {
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+  const url = getAuthUrl(telegramId)
+  const text = `🔗 <b>TAUTAN AKUN BARU</b>\n━━━━━━━━━━━━━━━━━━\nSistem memerlukan otorisasi eksternal untuk mengelola profil bisnis di email terpisah.\n\nKlik untuk melanjutkan otentikasi:`
+  const keyboard = new InlineKeyboard().url('🔐 Otorisasi via Web', url).row().text('❌ Batal', 'back_to_cabang')
+  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard })
+})
+
+bot.callbackQuery(/^confirm_add_branch_(.+)$/, async (ctx) => {
+  const accountId = ctx.match[1] 
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+
+  const user = await prisma.user.findUnique({ where: { telegramId } })
+  if (!user) return
+
+  const googleAccount = await prisma.googleAccount.findUnique({
+    where: { id: accountId }
+  })
+
+  if (!googleAccount) {
+    return ctx.answerCallbackQuery({ text: 'Akun Google tidak ditemukan!', show_alert: true })
+  }
+
+  const selectedTemplate = businessTemplates[Math.floor(Math.random() * businessTemplates.length)]!
+  const timestamp = Date.now()
+
+  const newBusiness = await prisma.business.create({
+    data: {
+      userId: user.id,
+      googleAccountId: googleAccount.id,
+      name: selectedTemplate.name,
+      gbpLocationId: `AUTO_LOC_${timestamp}`,
+      gbpAccountId: `AUTO_ACC_${timestamp}`,
+      isActive: true
     }
+  })
 
-    // Ambil ulasan dengan status NEW (Belum dibalas) dari bisnis user
-    const pendingReviews = await prisma.review.findMany({
-      where: { 
-        businessId: { in: user.businesses.map(b => b.id) },
-        status: 'NEW' 
-      },
-      include: { business: true },
-      orderBy: { publishedAt: 'desc' },
-      take: 1 // Tampilkan 1 ulasan tertua/terbaru untuk diurus
-    });
+  const reviewsToInsert = selectedTemplate.reviews.map((r, index) => ({
+    businessId: newBusiness.id,
+    gbpReviewId: `AUTO_REV_${newBusiness.id}_${index + 1}_${timestamp}`,
+    reviewerName: r.reviewerName,
+    rating: r.rating,
+    comment: r.comment,
+    status: 'NEW',
+    publishedAt: new Date()
+  }))
 
-    // Ambil elemen pertama dengan teknik destructuring yang aman
-    const [review] = pendingReviews;
+  await prisma.review.createMany({
+    data: reviewsToInsert,
+    skipDuplicates: true
+  })
 
-    // TypeScript sekarang tahu: Jika review tidak ada (undefined), kode berhenti di sini.
-    if (!review) {
-      return ctx.api.editMessageText(
-        ctx.chat.id, 
-        loadingMsg.message_id, 
-        "🎉 <b>Hebat!</b> Tidak ada ulasan yang antre. Semua sudah dibalas.", 
-        { parse_mode: 'HTML' }
-      );
+  const text = `🎉 <b>INTEGRASI BERHASIL</b>\n━━━━━━━━━━━━━━━━━━\n\nPemantauan AI untuk cabang <b>${newBusiness.name}</b> (terhubung dengan ${googleAccount.email}) resmi beroperasi.\n\nSistem telah mengunduh ulasan terbaru ke dalam antrean.`
+  
+  const keyboard = new InlineKeyboard()
+    .text('📥 Cek Antrean Ulasan', 'go_antrean').row()
+    .text('🔙 Manajemen Cabang', 'back_to_cabang')
+  
+  await ctx.editMessageText(text, { parse_mode: 'HTML', reply_markup: keyboard })
+})
+
+bot.callbackQuery('delete_branch', async (ctx) => {
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+
+  const user = await prisma.user.findUnique({ 
+    where: { telegramId }, 
+    include: { businesses: true } 
+  })
+
+  if (!user || user.businesses.length === 0) {
+    return ctx.answerCallbackQuery({ text: 'Tidak ada cabang untuk dihapus.', show_alert: true })
+  }
+
+  const keyboard = new InlineKeyboard()
+  user.businesses.forEach(b => {
+    keyboard.text(`🗑️ ${b.name}`, `confirm_delete_branch_${b.id}`).row()
+  })
+  
+  keyboard.text('🔙 Batal', 'back_to_cabang')
+
+  await ctx.editMessageText(
+    '🗑️ <b>HAPUS CABANG</b>\n━━━━━━━━━━━━━━━━━━\n\nPilih cabang bisnis yang ingin Anda hapus dari sistem:', 
+    { parse_mode: 'HTML', reply_markup: keyboard }
+  )
+})
+
+bot.callbackQuery(/^confirm_delete_branch_(.+)$/, async (ctx) => {
+  const businessId = ctx.match[1] as string
+  
+  const business = await prisma.business.findUnique({ where: { id: businessId } })
+  if (!business) {
+    return ctx.answerCallbackQuery({ text: 'Cabang tidak ditemukan!', show_alert: true })
+  }
+
+  const googleAccountId = business.googleAccountId
+
+  await prisma.reviewReply.deleteMany({ where: { review: { businessId: businessId } } })
+  await prisma.review.deleteMany({ where: { businessId: businessId } })
+  await prisma.business.delete({ where: { id: businessId } })
+
+  if (googleAccountId) {
+    const remainingBranches = await prisma.business.count({
+      where: { googleAccountId: googleAccountId }
+    })
+    
+    if (remainingBranches === 0) {
+      await prisma.googleAccount.delete({ where: { id: googleAccountId } })
     }
-
-    const stars = '⭐'.repeat(review.rating) + '🌑'.repeat(5 - review.rating);
-    
-    const messageText = `
-🔔 <b>ULASAN BELUM DIBALAS</b>
-🏪 <b>${review.business.name}</b>
-
-👤 <b>${review.reviewerName}</b>
-${stars} (${review.rating}/5)
-
-💬 <i>"${review.comment || 'Tanpa teks ulasan.'}"</i>
-
-👇 Pilih tindakan:`;
-
-    const keyboard = new InlineKeyboard()
-      .text("🤖 Racik Balasan AI", `generate_reply:${review.gbpReviewId}`).row()
-      .text("✍️ Balas Manual", `manual_reply:${review.gbpReviewId}`)
-      .text("❌ Abaikan", `ignore:${review.gbpReviewId}`);
-
-    await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, messageText, { parse_mode: 'HTML', reply_markup: keyboard });
-
-  } catch (error) {
-    console.error(error);
-    await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, "❌ Terjadi kesalahan sistem saat mengambil data.");
   }
-});
 
-// ==========================================
-// 3. HANDLER AKSI (INTERAKSI DENGAN DATABASE)
-// ==========================================
-
-bot.callbackQuery(/^generate_reply:(.+)$/, async (ctx) => {
-  const reviewId = ctx.match[1];
+  const keyboard = new InlineKeyboard().text('🔙 Kembali ke Manajemen Cabang', 'back_to_cabang')
   
-  // Ubah UI seketika agar tombol hilang (mencegah double-click)
-  await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
-  const originalText = ctx.callbackQuery.message?.text || "Ulasan";
-  
-  const loadingMsg = await ctx.reply("⏳ <i>Gemini sedang menganalisis dan meracik kalimat...</i>", { parse_mode: 'HTML' });
+  await ctx.editMessageText(
+    `✅ <b>CABANG/BISNIS DIHAPUS</b>\n━━━━━━━━━━━━━━━━━━\n\nCabang <b>${business.name}</b> telah berhasil dihapus secara permanen dari sistem.`, 
+    { parse_mode: 'HTML', reply_markup: keyboard }
+  )
+})
 
-  try {
-    // 1. Tarik data asli dari database
-    const review = await prisma.review.findUnique({
-      where: { gbpReviewId: reviewId },
-      include: { business: true }
-    });
+bot.callbackQuery('back_to_menu', async (ctx) => {
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+  const text = await renderMenu(telegramId)
+  await ctx.editMessageText(text, { parse_mode: 'HTML' })
+})
 
-    if (!review) throw new Error("Ulasan tidak ditemukan di database");
+bot.callbackQuery('back_to_cabang', async (ctx) => {
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+  const data = await renderCabang(telegramId)
+  if (!data) return
+  await ctx.editMessageText(data.text, { parse_mode: 'HTML', reply_markup: data.keyboard })
+})
 
-    // 2. Panggil AI berdasarkan ketersediaan komentar
-    let balasanAI = "";
-    if (!review.comment || review.comment === "-" || review.comment.trim() === "") {
-      balasanAI = await generateReplyNoComment(review.reviewerName, review.rating, review.business.name);
-    } else {
-      balasanAI = await generateReply(review.reviewerName, review.rating, review.comment, review.business.name);
+bot.callbackQuery(['back_to_antrean', 'go_antrean'], async (ctx) => {
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+  const data = await renderBranchList(telegramId, '📥 <b>PUSAT BALAS ULASAN</b>\n━━━━━━━━━━━━━━━━━━\nSilakan pilih lokasi bisnis untuk memproses antrean:', 'antrean', '📍')
+  if (!data) return ctx.editMessageText('❌ Cabang tidak ditemukan.')
+  await ctx.editMessageText(data.text, { parse_mode: 'HTML', reply_markup: data.keyboard })
+})
+
+bot.on('message:text', async (ctx) => {
+  if (ctx.message.reply_to_message) {
+    const text = ctx.message.reply_to_message.text
+    const match = text?.match(/\(Ref ID: ([a-zA-Z0-9]+)\)/)
+    
+    if (match && match[1]) {
+      const reviewId = match[1] as string
+      const newReply = ctx.message.text
+      
+      if (!newReply) return
+      
+      const review = await prisma.review.findUnique({ where: { id: reviewId } })
+      
+      if (!review) return
+      
+      await prisma.reviewReply.upsert({
+        where: { reviewId },
+        update: { body: newReply, source: 'MANUAL', postedAt: new Date() },
+        create: { reviewId, body: newReply, source: 'MANUAL', postedAt: new Date() }
+      })
+      
+      await prisma.review.update({
+        where: { id: reviewId },
+        data: { status: 'REPLIED' }
+      })
+      
+      await ctx.reply('✅ Balasan modifikasi Anda berhasil disimpan dan ditambahkan ke antrean publikasi.')
+      await processNextDraft(ctx, review.businessId)
     }
-
-    // 3. Siapkan UI Persetujuan
-    const keyboard = new InlineKeyboard()
-      .text("✅ Publikasikan ke Google", `send_google:${review.gbpReviewId}`).row()
-      .text("🔄 Generate Ulang", `generate_reply:${review.gbpReviewId}`)
-      .text("❌ Batal", `cancel_reply:${review.gbpReviewId}`);
-
-    await ctx.api.editMessageText(
-      ctx.chat?.id!, 
-      loadingMsg.message_id, 
-      `✨ <b>Draf Balasan AI:</b>\n\n<code>${balasanAI}</code>\n\n<i>Apakah kamu ingin mengirimkan balasan ini?</i>`,
-      { parse_mode: 'HTML', reply_markup: keyboard }
-    );
-    await ctx.answerCallbackQuery();
-
-  } catch (error) {
-    console.error(error);
-    await ctx.api.editMessageText(ctx.chat?.id!, loadingMsg.message_id, "❌ Gagal menghubungi AI Gemini. Silakan coba lagi.");
   }
-});
+})
 
-bot.callbackQuery(/^send_google:(.+)$/, async (ctx) => {
-  const reviewId = ctx.match[1];
-  
+bot.catch((err) => {
+  const ctx = err.ctx
+  const e = err.error
+  if (e instanceof GrammyError) {
+    if (e.description.includes('message is not modified')) return
+  }
+})
+
+async function main() {
   try {
-    // 1. Update status di Database menjadi REPLIED
-    await prisma.review.update({
-      where: { gbpReviewId: reviewId },
-      data: { status: 'REPLIED' } // Asumsi di skema Prisma kamu ada Enum status ini
-    });
-
-    // TODO: Di sinilah letak fungsi google.request(PUT reply) nantinya.
-    
-    // 2. Update UI
-    await ctx.editMessageText(
-      ctx.callbackQuery.message?.text + "\n\n✅ <b>Status: Berhasil dipublikasikan ke Google Maps!</b>", 
-      { parse_mode: 'HTML' }
-    );
-    await ctx.answerCallbackQuery({ text: "Terkirim ke Google Maps!", show_alert: true });
-    
-    // Tawarkan ulasan berikutnya
-    await ctx.reply("Ketik /antrean untuk melihat ulasan selanjutnya.");
-
+    startAllSchedulers(alertService)
+    await startServer()
+    await bot.start()
   } catch (error) {
-    await ctx.answerCallbackQuery({ text: "Gagal menyimpan ke database.", show_alert: true });
+    process.exit(1)
   }
-});
+}
 
-bot.callbackQuery(/^ignore:(.+)$/, async (ctx) => {
-  const reviewId = ctx.match[1];
-  
-  try {
-    // Update status agar tidak muncul lagi di antrean
-    await prisma.review.update({
-      where: { gbpReviewId: reviewId },
-      data: { status: 'IGNORED' }
-    });
+export { bot, alertService, prisma }
 
-    await ctx.editMessageText(
-      ctx.callbackQuery.message?.text + "\n\n<i>❌ Ulasan ini telah diabaikan dan dihapus dari antrean.</i>", 
-      { parse_mode: 'HTML' }
-    );
-    await ctx.answerCallbackQuery({ text: "Ulasan diabaikan." });
-  } catch (error) {
-    await ctx.answerCallbackQuery({ text: "Gagal memproses permintaan.", show_alert: true });
-  }
-});
-
-bot.callbackQuery(/^cancel_reply:(.+)$/, async (ctx) => {
-  // Kembali ke status awal tanpa mengubah database
-  await ctx.editMessageText("<i>Penyusunan balasan dibatalkan.</i>", { parse_mode: 'HTML' });
-  await ctx.answerCallbackQuery();
-});
-
-bot.callbackQuery(/^manual_reply:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery({ 
-    text: "Fitur balas manual sedang dalam pengembangan (MVP Phase).", 
-    show_alert: true 
-  });
-});
-
-bot.start()
-console.log('🤖 Bot berjalan dengan arsitektur Real Data...')
+main()
