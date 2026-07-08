@@ -1,5 +1,5 @@
 import 'dotenv/config'
-import { Bot, InlineKeyboard, GrammyError, HttpError } from 'grammy'
+import { Bot, InlineKeyboard, GrammyError, HttpError, InputFile } from 'grammy'
 import { PrismaClient } from '@prisma/client'
 import { createAlertService } from './services/telegram-alert.service.js'
 import { startAllSchedulers } from './schedulers.js'
@@ -7,6 +7,7 @@ import { getAuthUrl } from './google.js'
 import { startServer } from './server.js'
 import { generateReply, generateReplyNoComment } from './gemini-service.js'
 import { businessTemplates } from './templates.js'
+import { renderReviewDistributionChart } from './graphics/review-chart.js'
 
 const prisma = new PrismaClient({ log: ['error'] })
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN!)
@@ -17,9 +18,9 @@ const renderMenu = async (telegramId: string) => {
   const isConnected = user && user.googleAccounts && user.googleAccounts.length > 0
   let text = `🧭 <b>PUSAT KENDALI TROVE</b>\n━━━━━━━━━━━━━━━━━━\n\n`
   if (!isConnected) {
-    text += `🔗 /login - Otorisasi Akun Google\n📥 /antrean - Pusat Balas Ulasan`
+    text += `🔗 /login - Otorisasi Akun Google\n📥 /antrean - Pusat Balas Ulasan\n📊 /statistik - Statistik Ulasan`
   } else {
-    text += `🏢 /cabang - Kelola Lokasi Bisnis\n📥 /antrean - Pusat Balas Ulasan`
+    text += `🏢 /cabang - Kelola Lokasi Bisnis\n📥 /antrean - Pusat Balas Ulasan\n📊 /statistik - Statistik Ulasan`
   }
   return text
 }
@@ -160,6 +161,30 @@ bot.command('antrean', async (ctx) => {
   const data = await renderBranchList(telegramId, '📥 <b>PUSAT BALAS ULASAN</b>\n━━━━━━━━━━━━━━━━━━\nSilakan pilih lokasi bisnis untuk memproses antrean:', 'antrean', '📍')
   if (!data) return ctx.reply('❌ Anda belum memiliki bisnis aktif. Silahkan login terlebih dahulu')
   await ctx.reply(data.text, { parse_mode: 'HTML', reply_markup: data.keyboard })
+})
+
+bot.command('statistik', async (ctx) => {
+  const telegramId = ctx.from?.id.toString()
+  if (!telegramId) return
+  const data = await renderBranchList(telegramId, '📊 <b>STATISTIK ULASAN</b>\n━━━━━━━━━━━━━━━━━━\nPilih lokasi bisnis:', 'statistik', '📍')
+  if (!data) return ctx.reply('❌ Anda belum memiliki bisnis aktif. Silahkan login terlebih dahulu')
+  await ctx.reply(data.text, { parse_mode: 'HTML', reply_markup: data.keyboard })
+})
+
+bot.callbackQuery(/^statistik_(.+)$/, async (ctx) => {
+  const businessId = ctx.match[1] as string
+  const business = await prisma.business.findUnique({ where: { id: businessId } })
+  const reviews = await prisma.review.findMany({ where: { businessId } })
+
+  if (reviews.length === 0) {
+    return ctx.answerCallbackQuery({ text: 'Belum ada data ulasan untuk bisnis ini.' })
+  }
+
+  const chartBuffer = renderReviewDistributionChart(reviews)
+  await ctx.replyWithPhoto(new InputFile(chartBuffer, 'statistik.png'), {
+    caption: `📊 <b>Distribusi Rating — ${business?.name}</b>\n━━━━━━━━━━━━━━━━━━\nTotal ${reviews.length} ulasan.`,
+    parse_mode: 'HTML',
+  })
 })
 
 bot.callbackQuery(/^antrean_(.+)$/, async (ctx) => {
